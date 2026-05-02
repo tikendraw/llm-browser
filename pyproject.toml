@@ -1,0 +1,21 @@
+[project]
+name = "llm-browser"
+version = "0.1.0"
+description = "Query LLMs via browser automation using your free accounts"
+requires-python = ">=3.11"
+dependencies = [
+    "playwright>=1.44.0",
+    "typer>=0.12.0",
+    "rich>=13.7.0",
+    "anyio>=4.4.0",
+]
+
+[project.scripts]
+llm = "llm_browser.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["llm_browser"]
