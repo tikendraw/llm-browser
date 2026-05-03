@@ -18,6 +18,7 @@ import sys
 import typer
 from llm_browser.browser import browser_session
 from llm_browser.providers import get_provider, list_providers
+from llm_browser.providers.base import LimitReachedError
 from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
@@ -152,27 +153,31 @@ async def _ask(
 
     full_response = ""
 
-    async with browser_session(headless=headless, slow_mo=slow_mo) as session:
-        logged_in = await session.ensure_logged_in(provider)
-        if not logged_in:
-            console.print(
-                f"[yellow]Not logged in to {provider.meta.display_name}.[/yellow]\n"
-                f"Please log in using: [bold]llm login {provider_name}[/bold]\n"
-            )
-            raise typer.Exit(1)
+    try:
+        async with browser_session(headless=headless, slow_mo=slow_mo) as session:
+            logged_in = await session.ensure_logged_in(provider)
+            if not logged_in:
+                console.print(
+                    f"[yellow]Not logged in to {provider.meta.display_name}.[/yellow]\n"
+                    f"Please log in using: [bold]llm login {provider_name}[/bold]\n"
+                )
+                raise typer.Exit(1)
 
-        if raw:
-            # Stream plain text directly to stdout
-            async for chunk in session.query(provider, query, force_dom=force_dom):
-                print(chunk, end="", flush=True)
-                full_response += chunk
-            print()  # newline at end
-        else:
-            # Render Markdown live as chunks arrive
-            with Live(console=console, refresh_per_second=10, vertical_overflow="visible") as live:
+            if raw:
+                # Stream plain text directly to stdout
                 async for chunk in session.query(provider, query, force_dom=force_dom):
+                    print(chunk, end="", flush=True)
                     full_response += chunk
-                    live.update(Markdown(full_response))
+                print()  # newline at end
+            else:
+                # Render Markdown live as chunks arrive
+                with Live(console=console, refresh_per_second=10, vertical_overflow="visible") as live:
+                    async for chunk in session.query(provider, query, force_dom=force_dom):
+                        full_response += chunk
+                        live.update(Markdown(full_response))
+    except LimitReachedError as exc:
+        err.print(f"\n[bold red]Limit reached:[/bold red] {exc}\n")
+        raise typer.Exit(1) from exc
 
     console.print()
 

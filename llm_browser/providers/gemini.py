@@ -58,11 +58,11 @@ class GeminiProvider(BaseProvider):
     # ------------------------------------------------------------------
 
     async def dom_extract(self, page: Page) -> AsyncGenerator[str, None]:
+        # "Gemini said" is an h2.cdk-visually-hidden sibling of structured-content-container,
+        # not inside .markdown.markdown-main-panel — this selector avoids the duplication.
         selectors = [
-            "model-response .response-content",
-            "model-response",
-            "[class*='response-container']",
-            "message-content",
+            "message-content .markdown.markdown-main-panel",
+            "message-content .markdown",
         ]
         combined = ", ".join(selectors)
 
@@ -71,14 +71,14 @@ class GeminiProvider(BaseProvider):
         stable_needed = STREAM_SETTLE_MS // POLL_INTERVAL_MS
         deadline = asyncio.get_event_loop().time() + RESPONSE_TIMEOUT / 1000
 
-        await page.wait_for_selector(combined, timeout=RESPONSE_TIMEOUT)
+        await page.wait_for_selector("message-content .markdown", timeout=RESPONSE_TIMEOUT)
 
         while asyncio.get_event_loop().time() < deadline:
             current_text = ""
             for sel in selectors:
                 elements = await page.query_selector_all(sel)
                 if elements:
-                    current_text = await elements[-1].inner_text()
+                    current_text = (await elements[-1].inner_text()).strip()
                     break
 
             if current_text and current_text == last_text:
@@ -90,11 +90,18 @@ class GeminiProvider(BaseProvider):
                         delta = current_text[len(last_text):]
                         if delta:
                             yield delta
-                    else:
-                        yield current_text
+                    # Non-monotonic DOM update (Gemini re-renders chunks) — don't
+                    # re-emit the full text; just update the tracking cursor.
                     last_text = current_text
 
             if stable_count >= stable_needed:
-                break
+                # .response-footer.complete only appears after Gemini finishes;
+                # fall back to aria-label in case the footer class changes.
+                done = await page.query_selector(
+                    '.response-footer.complete, [aria-label="Good response"]'
+                )
+                if done:
+                    break
+                stable_count = 0  # still generating
 
             await page.wait_for_timeout(POLL_INTERVAL_MS)

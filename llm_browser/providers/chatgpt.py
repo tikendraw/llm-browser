@@ -1,10 +1,9 @@
 """Provider implementation for chatgpt.com."""
 
 import asyncio
-import json
 from typing import AsyncGenerator
 
-from playwright.async_api import Page, Response
+from playwright.async_api import Page
 
 from llm_browser.config import POLL_INTERVAL_MS, RESPONSE_TIMEOUT, STREAM_SETTLE_MS
 from llm_browser.providers.base import BaseProvider, ProviderMeta
@@ -45,76 +44,42 @@ class ChatGPTProvider(BaseProvider):
     # ------------------------------------------------------------------
 
     async def network_stream(self, page: Page, query: str) -> AsyncGenerator[str, None]:
-        """
-        ChatGPT streams from /backend-api/conversation via SSE.
-        Each `data:` line contains JSON with message delta content.
-        """
-        collected: list[str] = []
-        done_event = asyncio.Event()
-
-        async def handle_response(response: Response) -> None:
-            if "backend-api/conversation" not in response.url:
-                return
-            try:
-                body = await response.text()
-                for line in body.splitlines():
-                    if not line.startswith("data:"):
-                        continue
-                    raw = line[5:].strip()
-                    if raw in ("", "[DONE]"):
-                        continue
-                    try:
-                        data = json.loads(raw)
-                        parts = (
-                            data.get("message", {})
-                            .get("content", {})
-                            .get("parts", [])
-                        )
-                        if parts and isinstance(parts[0], str):
-                            collected.append(parts[0])
-                    except json.JSONDecodeError:
-                        pass
-            except Exception:
-                pass
-            finally:
-                done_event.set()
-
-        page.on("response", handle_response)
-        try:
-            await self.navigate_to_chat(page)
-            await self.submit_query(page, query)
-            await asyncio.wait_for(done_event.wait(), timeout=RESPONSE_TIMEOUT / 1000)
-            # parts are full snapshots; take the last one
-            yield collected[-1] if collected else ""
-        finally:
-            page.remove_listener("response", handle_response)
+        # ChatGPT now streams via WebSocket; HTTP response interception doesn't
+        # capture the tokens.  DOM extraction is reliable and avoids the
+        # double-submission that a failed network attempt causes.
+        raise NotImplementedError("ChatGPT: using DOM mode")
+        yield  # pragma: no cover
 
     # ------------------------------------------------------------------
     # Mode 2: DOM extraction
     # ------------------------------------------------------------------
 
     async def dom_extract(self, page: Page) -> AsyncGenerator[str, None]:
-        selectors = [
-            '[data-message-author-role="assistant"]',
-            '[class*="agent-turn"]',
-            '.markdown',
-        ]
-        combined = ", ".join(selectors)
+        # Scope everything to the last assistant turn so we never confuse
+        # action buttons or text from a previous turn with the current one.
+        # ChatGPT numbers turns with data-testid="conversation-turn-N" and
+        # marks role with data-turn="assistant".
+        text_selectors = [".markdown.prose", ".markdown"]
 
         last_text = ""
         stable_count = 0
         stable_needed = STREAM_SETTLE_MS // POLL_INTERVAL_MS
         deadline = asyncio.get_event_loop().time() + RESPONSE_TIMEOUT / 1000
 
-        await page.wait_for_selector(combined, timeout=RESPONSE_TIMEOUT)
+        await page.wait_for_selector('[data-turn="assistant"]', timeout=RESPONSE_TIMEOUT)
 
         while asyncio.get_event_loop().time() < deadline:
+            # Always re-query the LAST assistant turn (new turns may appear)
+            turns = await page.query_selector_all('[data-turn="assistant"]')
+            last_turn = turns[-1] if turns else None
+
             current_text = ""
-            for sel in selectors:
-                elements = await page.query_selector_all(sel)
-                if elements:
-                    current_text = await elements[-1].inner_text()
-                    break
+            if last_turn:
+                for sel in text_selectors:
+                    els = await last_turn.query_selector_all(sel)
+                    if els:
+                        current_text = (await els[-1].inner_text()).strip()
+                        break
 
             if current_text and current_text == last_text:
                 stable_count += 1
@@ -125,11 +90,17 @@ class ChatGPTProvider(BaseProvider):
                         delta = current_text[len(last_text):]
                         if delta:
                             yield delta
-                    else:
-                        yield current_text
                     last_text = current_text
 
-            if stable_count >= stable_needed:
-                break
+            if stable_count >= stable_needed and last_turn:
+                # Check copy button scoped to THIS turn only — avoids false
+                # positives from previous turns' action buttons.
+                done = await last_turn.query_selector(
+                    '[data-testid="copy-turn-action-button"], '
+                    '[data-testid="good-response-turn-action-button"]'
+                )
+                if done:
+                    break
+                stable_count = 0  # still generating
 
             await page.wait_for_timeout(POLL_INTERVAL_MS)

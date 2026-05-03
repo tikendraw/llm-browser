@@ -7,6 +7,10 @@ from typing import AsyncGenerator
 from playwright.async_api import Page
 
 
+class LimitReachedError(RuntimeError):
+    """Raised when a provider's usage/rate limit is hit."""
+
+
 @dataclass(frozen=True)
 class ProviderMeta:
     name: str
@@ -80,6 +84,8 @@ class BaseProvider(ABC):
                 async for chunk in self._network_query(page, query):
                     yield chunk
                 return
+            except LimitReachedError:
+                raise
             except Exception:
                 pass  # fall through to DOM mode
 

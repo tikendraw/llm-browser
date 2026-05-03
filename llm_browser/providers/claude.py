@@ -7,7 +7,12 @@ from typing import AsyncGenerator
 from playwright.async_api import Page, Response
 
 from llm_browser.config import POLL_INTERVAL_MS, RESPONSE_TIMEOUT, STREAM_SETTLE_MS
-from llm_browser.providers.base import BaseProvider, ProviderMeta
+from llm_browser.providers.base import BaseProvider, LimitReachedError, ProviderMeta
+
+_RATE_LIMIT_SEL = 'text="Upgrade to keep chatting"'
+_RATE_LIMIT_MSG = (
+    "Claude message limit reached. Check the banner for the reset time."
+)
 
 
 class ClaudeProvider(BaseProvider):
@@ -50,6 +55,11 @@ class ClaudeProvider(BaseProvider):
         await page.keyboard.type(query, delay=20)
         await page.keyboard.press("Enter")
 
+    async def _check_rate_limit(self, page: Page) -> None:
+        el = await page.query_selector(_RATE_LIMIT_SEL)
+        if el:
+            raise LimitReachedError(_RATE_LIMIT_MSG)
+
     # ------------------------------------------------------------------
     # Mode 1: network interception (SSE stream)
     # ------------------------------------------------------------------
@@ -85,15 +95,17 @@ class ClaudeProvider(BaseProvider):
                             collected.append(delta)
                     except json.JSONDecodeError:
                         pass
+                if collected:
+                    done_event.set()
             except Exception:
                 pass
-            finally:
-                done_event.set()
 
         page.on("response", handle_response)
         try:
             await self.navigate_to_chat(page)
             await self.submit_query(page, query)
+            await page.wait_for_timeout(1_500)
+            await self._check_rate_limit(page)
             # wait for the response handler to fire
             await asyncio.wait_for(
                 done_event.wait(),
@@ -110,14 +122,12 @@ class ClaudeProvider(BaseProvider):
     async def dom_extract(self, page: Page) -> AsyncGenerator[str, None]:
         """
         Poll the last assistant message block until text stabilises.
-        Claude renders responses inside elements with data-testid="assistant-message"
-        or a class containing 'font-claude-message'.
+        Claude marks its response container with data-is-streaming="true|false";
+        the prose lives inside .font-claude-response > .standard-markdown.
         """
-        # Selectors to try in order
         selectors = [
-            '[data-testid="assistant-message"]',
-            '.font-claude-message',
-            '[class*="assistant-message"]',
+            '.font-claude-response .standard-markdown',
+            '.font-claude-response',
         ]
 
         last_text = ""
@@ -125,17 +135,16 @@ class ClaudeProvider(BaseProvider):
         stable_needed = STREAM_SETTLE_MS // POLL_INTERVAL_MS
         deadline = asyncio.get_event_loop().time() + RESPONSE_TIMEOUT / 1000
 
-        # Wait for at least one response block to appear
-        combined = ", ".join(selectors)
-        await page.wait_for_selector(combined, timeout=RESPONSE_TIMEOUT)
+        await page.wait_for_selector('.font-claude-response', timeout=RESPONSE_TIMEOUT)
 
         while asyncio.get_event_loop().time() < deadline:
+            await self._check_rate_limit(page)
             current_text = ""
             for sel in selectors:
                 elements = await page.query_selector_all(sel)
                 if elements:
                     # Use the LAST element (most recent assistant turn)
-                    current_text = await elements[-1].inner_text()
+                    current_text = (await elements[-1].inner_text()).strip()
                     break
 
             if current_text and current_text == last_text:
@@ -143,16 +152,17 @@ class ClaudeProvider(BaseProvider):
             else:
                 stable_count = 0
                 if current_text:
-                    # Yield only the new delta
                     if current_text.startswith(last_text):
                         delta = current_text[len(last_text):]
                         if delta:
                             yield delta
-                    else:
-                        yield current_text  # full replace (edge case)
                     last_text = current_text
 
             if stable_count >= stable_needed:
-                break
+                # action-bar-copy only renders after Claude finishes the turn
+                done = await page.query_selector('[data-testid="action-bar-copy"]')
+                if done:
+                    break
+                stable_count = 0  # still generating
 
             await page.wait_for_timeout(POLL_INTERVAL_MS)

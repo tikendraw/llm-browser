@@ -12,6 +12,7 @@ dependencies = [
 
 [project.scripts]
 llm = "llm_browser.cli:app"
+llm-inspect = "llm_browser.utils.dom_inspector:app"
 
 [build-system]
 requires = ["hatchling"]
