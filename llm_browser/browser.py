@@ -73,6 +73,12 @@ class BrowserSession:
             raise RuntimeError("Session not started. Call start() first.")
         return self._page
 
+    @property
+    def context(self) -> BrowserContext:
+        if self._context is None:
+            raise RuntimeError("Session not started. Call start() first.")
+        return self._context
+
     # ------------------------------------------------------------------
     # High-level query
     # ------------------------------------------------------------------
