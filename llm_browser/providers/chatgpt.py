@@ -93,13 +93,13 @@ class ChatGPTProvider(BaseProvider):
                     last_text = current_text
 
             if stable_count >= stable_needed and last_turn:
-                # Check copy button scoped to THIS turn only — avoids false
-                # positives from previous turns' action buttons.
-                done = await last_turn.query_selector(
-                    '[data-testid="copy-turn-action-button"], '
-                    '[data-testid="good-response-turn-action-button"]'
+                # ChatGPT sets data-stream-active on the scroll root while
+                # generating and removes it when done. The copy button is always
+                # in the DOM (just CSS-hidden), so it's not a reliable signal.
+                is_streaming = await page.evaluate(
+                    "() => document.querySelector('[data-stream-active]') !== null"
                 )
-                if done:
+                if not is_streaming:
                     break
                 stable_count = 0  # still generating
 

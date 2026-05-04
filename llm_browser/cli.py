@@ -6,6 +6,8 @@ Usage examples:
   llm ask gpt "what is RLHF"
   llm ask gemini "summarise the CAP theorem"
   echo "write a haiku about linux" | llm ask claude -
+  llm ask claude "summarise this" -f report.txt
+  llm ask claude "what's in these files?" -f a.py -f b.py
   llm login claude
   llm list
 """
@@ -15,16 +17,19 @@ from __future__ import annotations
 import asyncio
 import sys
 import time
+from pathlib import Path
 from typing import Optional
 
 import typer
 from llm_browser.browser import browser_session
+from llm_browser.db import get_chat, get_chats, init_db, save_chat
 from llm_browser.providers import get_provider, list_providers
 from llm_browser.providers.base import BaseProvider, LimitReachedError
 from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.table import Table
 from rich.text import Text
 
 app = typer.Typer(
@@ -34,6 +39,47 @@ app = typer.Typer(
 )
 console = Console()
 err = Console(stderr=True)
+
+init_db()
+
+
+# ──────────────────────────────────────────────────────────────────────
+# File injection helper
+# ──────────────────────────────────────────────────────────────────────
+
+def _resolve_query(query: Optional[str]) -> str:
+    """Return the query string, reading from stdin when appropriate."""
+    if query is None or query == "-":
+        if sys.stdin.isatty():
+            err.print("[red]Error:[/red] no query provided and stdin is a terminal")
+            raise typer.Exit(1)
+        text = sys.stdin.read().strip()
+        if not text:
+            err.print("[red]Error:[/red] empty query on stdin")
+            raise typer.Exit(1)
+        return text
+    return query
+
+
+def _inject_files(query: str, files: list[Path]) -> str:
+    """Prepend each file's content to *query* wrapped in <file> tags."""
+    if not files:
+        return query
+    parts: list[str] = []
+    for f in files:
+        if not f.exists():
+            err.print(f"[red]Error:[/red] file not found: {f}")
+            raise typer.Exit(1)
+        try:
+            content = f.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            err.print(
+                f"[red]Error:[/red] {f.name} appears to be a binary file. "
+                "Only text files are supported."
+            )
+            raise typer.Exit(1)
+        parts.append(f'<file name="{f.name}">\n{content}\n</file>')
+    return "\n\n".join(parts) + "\n\n" + query
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -83,9 +129,16 @@ async def _login(provider_name: str) -> None:
 @app.command("ask")
 def ask_cmd(
     provider_name: str = typer.Argument(..., help="Provider: claude | chatgpt | gemini"),
-    query: str = typer.Argument(
-        ...,
-        help='Query text, or "-" to read from stdin',
+    query: Optional[str] = typer.Argument(
+        None,
+        help='Query text, "-" to read from stdin, or omit when piping',
+    ),
+    files: Optional[list[Path]] = typer.Option(
+        None,
+        "--file",
+        "-f",
+        help="File(s) to attach — content is injected before the query. Repeatable.",
+        exists=False,  # we validate manually for better error messages
     ),
     dom: bool = typer.Option(
         False,
@@ -111,20 +164,22 @@ def ask_cmd(
     """
     Ask a question and stream the response to your terminal.
 
-    Pass "-" as QUERY to read from stdin:
+    Pipe input directly — no "-" needed:
 
-      echo "what is 2+2" | llm ask claude -
+      echo "what is 2+2" | llm ask claude
+
+    Attach files whose content will be included in the query:
+
+      llm ask claude "summarise this" -f report.txt
+      llm ask claude "explain the diff" -f old.py -f new.py
     """
-    if query == "-":
-        query = sys.stdin.read().strip()
-        if not query:
-            err.print("[red]Error:[/red] empty query on stdin")
-            raise typer.Exit(1)
+    q = _resolve_query(query)
+    q = _inject_files(q, files or [])
 
     asyncio.run(
         _ask(
             provider_name=provider_name,
-            query=query,
+            query=q,
             force_dom=dom,
             raw=raw,
             headless=headless,
@@ -155,6 +210,7 @@ async def _ask(
     )
 
     full_response = ""
+    start = time.monotonic()
 
     try:
         async with browser_session(headless=headless, slow_mo=slow_mo) as session:
@@ -182,6 +238,10 @@ async def _ask(
         err.print(f"\n[bold red]Limit reached:[/bold red] {exc}\n")
         raise typer.Exit(1) from exc
 
+    if full_response:
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        save_chat(provider.meta.name, query, full_response, elapsed_ms)
+
     console.print()
 
 
@@ -191,15 +251,22 @@ async def _ask(
 
 @app.command("compare")
 def compare_cmd(
-    query: str = typer.Argument(
-        ...,
-        help='Query to send, or "-" to read from stdin',
+    query: Optional[str] = typer.Argument(
+        None,
+        help='Query to send, "-" to read from stdin, or omit when piping',
     ),
     provider: Optional[list[str]] = typer.Option(
         None,
         "--provider",
         "-p",
         help="Provider to include (repeat for multiple). Default: all providers.",
+    ),
+    files: Optional[list[Path]] = typer.Option(
+        None,
+        "--file",
+        "-f",
+        help="File(s) to attach — content is injected before the query. Repeatable.",
+        exists=False,
     ),
     dom: bool = typer.Option(False, "--dom", help="Force DOM extraction mode"),
     raw: bool = typer.Option(False, "--raw", help="Print plain text instead of Markdown"),
@@ -215,13 +282,12 @@ def compare_cmd(
 
       llm compare -p claude -p chatgpt "explain transformers"
 
-      echo "write a haiku" | llm compare -
+      echo "write a haiku" | llm compare
+
+      llm compare "review this code" -f main.py
     """
-    if query == "-":
-        query = sys.stdin.read().strip()
-        if not query:
-            err.print("[red]Error:[/red] empty query on stdin")
-            raise typer.Exit(1)
+    q = _resolve_query(query)
+    q = _inject_files(q, files or [])
 
     provider_names = provider or [p.meta.name for p in list_providers()]
 
@@ -237,7 +303,7 @@ def compare_cmd(
     asyncio.run(
         _compare(
             providers=resolved,
-            query=query,
+            query=q,
             force_dom=dom,
             raw=raw,
             headless=headless,
@@ -312,8 +378,65 @@ async def _compare(
                 else:
                     content = text if raw else Markdown(text)
                     console.print(Panel(content, title=title, border_style="cyan"))
+                    save_chat(provider.meta.name, query, text, int(elapsed * 1000))
 
                 console.print()
+
+
+# ──────────────────────────────────────────────────────────────────────
+# llm history  /  llm show <id>
+# ──────────────────────────────────────────────────────────────────────
+
+@app.command("history")
+def history_cmd(
+    limit: int = typer.Option(20, "--limit", "-n", help="Number of chats to show"),
+    provider: Optional[str] = typer.Option(
+        None, "--provider", "-p", help="Filter by provider"
+    ),
+) -> None:
+    """Show recent chat history."""
+    chats = get_chats(limit=limit, provider=provider)
+    if not chats:
+        console.print("[dim]No chats saved yet.[/dim]")
+        return
+
+    table = Table(show_header=True, header_style="bold", box=None, padding=(0, 1))
+    table.add_column("ID", style="dim", width=5)
+    table.add_column("Provider", style="cyan", width=10)
+    table.add_column("When", style="dim", width=19)
+    table.add_column("Query", no_wrap=False)
+
+    for c in chats:
+        preview = c.query.replace("\n", " ")
+        if len(preview) > 80:
+            preview = preview[:79] + "…"
+        table.add_row(str(c.id), c.provider, c.created_at, preview)
+
+    console.print()
+    console.print(table)
+    console.print(f"\n[dim]Use [bold]llm show <id>[/bold] to read a full response.[/dim]\n")
+
+
+@app.command("show")
+def show_cmd(
+    chat_id: int = typer.Argument(..., help="Chat ID from llm history"),
+    raw: bool = typer.Option(False, "--raw", help="Print plain text instead of Markdown"),
+) -> None:
+    """Display the full query and response for a saved chat."""
+    chat = get_chat(chat_id)
+    if not chat:
+        err.print(f"[red]Error:[/red] no chat with id {chat_id}")
+        raise typer.Exit(1)
+
+    dur = f"{chat.duration_ms / 1000:.1f}s" if chat.duration_ms else "—"
+    console.print(
+        f"\n[dim]#{chat.id}  {chat.provider}  {chat.created_at}  {dur}[/dim]\n"
+    )
+    console.print(Panel(chat.query, title="Query", border_style="dim"))
+    console.print()
+    content = chat.response if raw else Markdown(chat.response)
+    console.print(Panel(content, title="Response", border_style="cyan"))
+    console.print()
 
 
 # ──────────────────────────────────────────────────────────────────────

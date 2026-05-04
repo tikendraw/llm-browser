@@ -29,13 +29,12 @@ class GeminiProvider(BaseProvider):
         )
 
     async def submit_query(self, page: Page, query: str) -> None:
-        # Gemini uses a rich-textarea web component
         composer = page.locator("rich-textarea").first
         if await composer.count() == 0:
             composer = page.locator('[contenteditable="true"]').first
         await composer.click()
-        await page.keyboard.type(query, delay=20)
-        # Try send button first
+        await composer.fill(query)
+        await page.wait_for_timeout(150)
         send_btn = page.locator('button[aria-label*="Send"], button[data-mat-icon-name="send"]').first
         if await send_btn.count() > 0 and await send_btn.is_enabled():
             await send_btn.click()

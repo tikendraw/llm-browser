@@ -6,6 +6,7 @@ from pathlib import Path
 CONFIG_DIR = Path.home() / ".config" / "llm-browser"
 PROFILE_DIR = CONFIG_DIR / "browser-profile"   # persistent Chromium profile
 LOGS_DIR = CONFIG_DIR / "logs"
+DB_PATH = CONFIG_DIR / "history.db"
 
 # Ensure dirs exist at import time (safe to call multiple times)
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)

@@ -48,11 +48,10 @@ class ClaudeProvider(BaseProvider):
     # ------------------------------------------------------------------
 
     async def submit_query(self, page: Page, query: str) -> None:
-        # Claude uses a contenteditable div
         composer = page.locator('div[contenteditable="true"]').first
         await composer.click()
-        await composer.fill("")
-        await page.keyboard.type(query, delay=20)
+        await composer.fill(query)
+        await page.wait_for_timeout(150)
         await page.keyboard.press("Enter")
 
     async def _check_rate_limit(self, page: Page) -> None:
