@@ -10,21 +10,30 @@ Usage examples:
   llm ask claude "what's in these files?" -f a.py -f b.py
   llm login claude
   llm list
+  llm serve                  # start daemon in foreground
+  llm daemon start           # start daemon in background
+  llm daemon stop            # stop daemon
+  llm daemon status          # check if daemon is running
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
+import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Optional
 
 import typer
+from llm_browser import client
 from llm_browser.browser import browser_session
-from llm_browser.db import get_chat, get_chats, init_db, save_chat
+from llm_browser.config import PID_PATH, SERVER_LOG, SOCKET_PATH
+from llm_browser.db import get_chat, get_chats, init_db
 from llm_browser.providers import get_provider, list_providers
-from llm_browser.providers.base import BaseProvider, LimitReachedError
+from llm_browser.providers.base import LimitReachedError
 from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
@@ -37,6 +46,9 @@ app = typer.Typer(
     help="Query LLMs via your browser — no API key needed.",
     no_args_is_help=True,
 )
+daemon_app = typer.Typer(help="Manage the background browser daemon.")
+app.add_typer(daemon_app, name="daemon")
+
 console = Console()
 err = Console(stderr=True)
 
@@ -150,19 +162,11 @@ def ask_cmd(
         "--raw",
         help="Print plain text instead of rendered Markdown",
     ),
-    headless: bool = typer.Option(
-        False,
-        "--headless",
-        help="Run browser in headless mode (may break some sites)",
-    ),
-    slow: bool = typer.Option(
-        False,
-        "--slow",
-        help="Add 50ms delay between actions (helps with flaky UIs)",
-    ),
 ) -> None:
     """
     Ask a question and stream the response to your terminal.
+
+    Requires the daemon to be running: llm daemon start
 
     Pipe input directly — no "-" needed:
 
@@ -182,8 +186,6 @@ def ask_cmd(
             query=q,
             force_dom=dom,
             raw=raw,
-            headless=headless,
-            slow_mo=50 if slow else 0,
         )
     )
 
@@ -194,53 +196,44 @@ async def _ask(
     query: str,
     force_dom: bool,
     raw: bool,
-    headless: bool,
-    slow_mo: int,
 ) -> None:
+    if not await client.is_server_running():
+        err.print(
+            "[red]Error:[/red] daemon is not running.\n"
+            "Start it with: [bold]llm daemon start[/bold]"
+        )
+        raise typer.Exit(1)
+
     try:
-        provider = get_provider(provider_name)
+        get_provider(provider_name)  # validate name early
     except ValueError as exc:
         err.print(f"[red]Error:[/red] {exc}")
         raise typer.Exit(1) from exc
 
-    mode_label = "DOM" if force_dom else "network→DOM"
     console.print(
-        f"\n[dim]Provider:[/dim] [cyan]{provider.meta.display_name}[/cyan]  "
-        f"[dim]Mode:[/dim] [cyan]{mode_label}[/cyan]\n"
+        f"\n[dim]Provider:[/dim] [cyan]{provider_name}[/cyan]  "
+        f"[dim]Mode:[/dim] [cyan]{'DOM' if force_dom else 'network→DOM'}[/cyan]  "
+        f"[dim]via daemon[/dim]\n"
     )
 
     full_response = ""
-    start = time.monotonic()
-
     try:
-        async with browser_session(headless=headless, slow_mo=slow_mo) as session:
-            logged_in = await session.ensure_logged_in(provider)
-            if not logged_in:
-                console.print(
-                    f"[yellow]Not logged in to {provider.meta.display_name}.[/yellow]\n"
-                    f"Please log in using: [bold]llm login {provider_name}[/bold]\n"
-                )
-                raise typer.Exit(1)
-
-            if raw:
-                # Stream plain text directly to stdout
-                async for chunk in session.query(provider, query, force_dom=force_dom):
-                    print(chunk, end="", flush=True)
+        if raw:
+            async for chunk in client.ask(provider_name, query, force_dom=force_dom):
+                print(chunk, end="", flush=True)
+                full_response += chunk
+            print()
+        else:
+            with Live(console=console, refresh_per_second=10, vertical_overflow="visible") as live:
+                async for chunk in client.ask(provider_name, query, force_dom=force_dom):
                     full_response += chunk
-                print()  # newline at end
-            else:
-                # Render Markdown live as chunks arrive
-                with Live(console=console, refresh_per_second=10, vertical_overflow="visible") as live:
-                    async for chunk in session.query(provider, query, force_dom=force_dom):
-                        full_response += chunk
-                        live.update(Markdown(full_response))
+                    live.update(Markdown(full_response))
     except LimitReachedError as exc:
         err.print(f"\n[bold red]Limit reached:[/bold red] {exc}\n")
         raise typer.Exit(1) from exc
-
-    if full_response:
-        elapsed_ms = int((time.monotonic() - start) * 1000)
-        save_chat(provider.meta.name, query, full_response, elapsed_ms)
+    except RuntimeError as exc:
+        err.print(f"\n[red]Error:[/red] {exc}\n")
+        raise typer.Exit(1) from exc
 
     console.print()
 
@@ -270,11 +263,11 @@ def compare_cmd(
     ),
     dom: bool = typer.Option(False, "--dom", help="Force DOM extraction mode"),
     raw: bool = typer.Option(False, "--raw", help="Print plain text instead of Markdown"),
-    headless: bool = typer.Option(False, "--headless"),
-    slow: bool = typer.Option(False, "--slow"),
 ) -> None:
     """
     Send the same query to multiple providers in parallel and compare responses.
+
+    Requires the daemon to be running: llm daemon start
 
     Examples:
 
@@ -292,95 +285,71 @@ def compare_cmd(
     provider_names = provider or [p.meta.name for p in list_providers()]
 
     # Validate all names up front
-    resolved: list[BaseProvider] = []
     for name in provider_names:
         try:
-            resolved.append(get_provider(name))
+            get_provider(name)
         except ValueError as exc:
             err.print(f"[red]Error:[/red] {exc}")
             raise typer.Exit(1) from exc
 
     asyncio.run(
         _compare(
-            providers=resolved,
+            provider_names=provider_names,
             query=q,
             force_dom=dom,
             raw=raw,
-            headless=headless,
-            slow_mo=50 if slow else 0,
         )
     )
 
 
-async def _run_one(
-    provider: BaseProvider,
-    context,  # BrowserContext — typed loosely to avoid circular import
-    query: str,
-    force_dom: bool,
-) -> tuple[str, float, Exception | None]:
-    """Query one provider on a dedicated page. Returns (text, elapsed_s, error)."""
-    page = await context.new_page()
-    start = time.monotonic()
-    text = ""
-    error: Exception | None = None
-    try:
-        if not await provider.is_logged_in(page):
-            raise RuntimeError(f"Not logged in — run: llm login {provider.meta.name}")
-        async for chunk in provider.query(page, query, force_dom=force_dom):
-            text += chunk
-    except Exception as exc:
-        error = exc
-    finally:
-        await page.close()
-    return text, time.monotonic() - start, error
-
-
 async def _compare(
     *,
-    providers: list[BaseProvider],
+    provider_names: list[str],
     query: str,
     force_dom: bool,
     raw: bool,
-    headless: bool,
-    slow_mo: int,
 ) -> None:
+    if not await client.is_server_running():
+        err.print(
+            "[red]Error:[/red] daemon is not running.\n"
+            "Start it with: [bold]llm daemon start[/bold]"
+        )
+        raise typer.Exit(1)
+
     q_preview = query[:72] + "…" if len(query) > 72 else query
-    names = ", ".join(f"[cyan]{p.meta.name}[/cyan]" for p in providers)
+    names = ", ".join(f"[cyan]{n}[/cyan]" for n in provider_names)
     console.print(f"\n[dim]Query:[/dim] [bold]{q_preview}[/bold]")
-    console.print(f"[dim]Providers ({len(providers)}):[/dim] {names}\n")
+    console.print(f"[dim]Providers ({len(provider_names)}):[/dim] {names}  [dim]via daemon[/dim]\n")
 
-    async with browser_session(headless=headless, slow_mo=slow_mo) as session:
-        # Each provider gets its own page so they run truly in parallel.
-        task_to_provider = {
-            asyncio.create_task(
-                _run_one(p, session.context, query, force_dom)
-            ): p
-            for p in providers
-        }
+    # Buffer text and timing per provider; render panel when each finishes.
+    buffers: dict[str, str] = {name: "" for name in provider_names}
+    completed = 0
+    total = len(provider_names)
 
-        pending = set(task_to_provider)
-        completed = 0
+    async for pname, chunk, elapsed_ms, error in client.compare(
+        provider_names, query, force_dom=force_dom
+    ):
+        if pname == "" and chunk is None and elapsed_ms is None and error is None:
+            # all_done sentinel
+            break
 
-        while pending:
-            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            for task in done:
-                completed += 1
-                provider = task_to_provider[task]
-                text, elapsed, error = task.result()
-
-                subtitle = f"[dim]{elapsed:.1f}s  ·  {completed}/{len(providers)}[/dim]"
-                title = f"[bold cyan]{provider.meta.display_name}[/bold cyan]  {subtitle}"
-
-                if error:
-                    console.print(
-                        Panel(f"[red]{error}[/red]", title=title, border_style="red")
-                    )
-                else:
-                    content = text if raw else Markdown(text)
-                    console.print(Panel(content, title=title, border_style="cyan"))
-                    save_chat(provider.meta.name, query, text, int(elapsed * 1000))
-
-                console.print()
+        if chunk is not None:
+            buffers[pname] = buffers.get(pname, "") + chunk
+        elif elapsed_ms is not None:
+            # provider finished successfully
+            completed += 1
+            text = buffers.get(pname, "")
+            subtitle = f"[dim]{elapsed_ms / 1000:.1f}s  ·  {completed}/{total}[/dim]"
+            title = f"[bold cyan]{pname}[/bold cyan]  {subtitle}"
+            content = text if raw else Markdown(text)
+            console.print(Panel(content, title=title, border_style="cyan"))
+            console.print()
+        elif error is not None:
+            completed += 1
+            subtitle = f"[dim]{completed}/{total}[/dim]"
+            title = f"[bold cyan]{pname}[/bold cyan]  {subtitle}"
+            console.print(Panel(f"[red]{error}[/red]", title=title, border_style="red"))
+            console.print()
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -437,6 +406,121 @@ def show_cmd(
     content = chat.response if raw else Markdown(chat.response)
     console.print(Panel(content, title="Response", border_style="cyan"))
     console.print()
+
+
+# ──────────────────────────────────────────────────────────────────────
+# llm serve  (foreground daemon)
+# ──────────────────────────────────────────────────────────────────────
+
+@app.command("serve")
+def serve_cmd(
+    headless: bool = typer.Option(False, "--headless", help="Run browser headlessly"),
+    slow: bool = typer.Option(False, "--slow", help="Add 50ms delay between actions"),
+) -> None:
+    """Start the browser daemon in the foreground. Press Ctrl-C to stop."""
+    from llm_browser.server import LLMServer
+
+    server = LLMServer(headless=headless, slow_mo=50 if slow else 0)
+
+    async def _run() -> None:
+        loop = asyncio.get_running_loop()
+        stopped = asyncio.Event()
+
+        def _shutdown() -> None:
+            stopped.set()
+
+        loop.add_signal_handler(signal.SIGTERM, _shutdown)
+        loop.add_signal_handler(signal.SIGINT, _shutdown)
+
+        serve_task = asyncio.create_task(server.start())
+        await stopped.wait()
+        serve_task.cancel()
+        await server.stop()
+
+    try:
+        asyncio.run(_run())
+    except (KeyboardInterrupt, SystemExit):
+        pass
+
+
+# ──────────────────────────────────────────────────────────────────────
+# llm daemon start | stop | status
+# ──────────────────────────────────────────────────────────────────────
+
+@daemon_app.command("start")
+def daemon_start(
+    headless: bool = typer.Option(False, "--headless"),
+    slow: bool = typer.Option(False, "--slow"),
+) -> None:
+    """Start the browser daemon in the background."""
+    if asyncio.run(client.is_server_running()):
+        pid = PID_PATH.read_text().strip() if PID_PATH.exists() else "?"
+        console.print(f"[yellow]Daemon already running[/yellow] (PID {pid})")
+        return
+
+    args = [sys.executable, "-m", "llm_browser.server"]
+    if headless:
+        args.append("--headless")
+    if slow:
+        args.append("--slow")
+
+    log_file = SERVER_LOG.open("w")
+    proc = subprocess.Popen(
+        args,
+        start_new_session=True,
+        stdout=log_file,
+        stderr=log_file,
+    )
+
+    # Wait briefly for the socket to appear
+    for _ in range(20):
+        time.sleep(0.2)
+        if SOCKET_PATH.exists():
+            break
+
+    if SOCKET_PATH.exists():
+        console.print(f"[green]Daemon started[/green] (PID {proc.pid})")
+        console.print(f"[dim]Log: {SERVER_LOG}[/dim]")
+    else:
+        console.print(f"[red]Daemon failed to start.[/red] Check log: {SERVER_LOG}")
+        raise typer.Exit(1)
+
+
+@daemon_app.command("stop")
+def daemon_stop() -> None:
+    """Stop the background daemon."""
+    if not PID_PATH.exists():
+        console.print("[dim]Daemon is not running (no PID file).[/dim]")
+        return
+
+    pid_str = PID_PATH.read_text().strip()
+    try:
+        pid = int(pid_str)
+        os.kill(pid, signal.SIGTERM)
+        # Wait for socket to disappear
+        for _ in range(20):
+            time.sleep(0.2)
+            if not SOCKET_PATH.exists():
+                break
+        console.print(f"[green]Daemon stopped[/green] (PID {pid})")
+    except ProcessLookupError:
+        console.print("[dim]Daemon process not found — cleaning up stale PID file.[/dim]")
+        PID_PATH.unlink(missing_ok=True)
+        SOCKET_PATH.unlink(missing_ok=True)
+    except ValueError:
+        console.print(f"[red]Error:[/red] invalid PID file contents: {pid_str!r}")
+        raise typer.Exit(1)
+
+
+@daemon_app.command("status")
+def daemon_status() -> None:
+    """Check whether the daemon is running."""
+    running = asyncio.run(client.is_server_running())
+    if running:
+        pid = PID_PATH.read_text().strip() if PID_PATH.exists() else "?"
+        console.print(f"[green]running[/green] (PID {pid})")
+    else:
+        console.print("[dim]not running[/dim]")
 
 
 # ──────────────────────────────────────────────────────────────────────

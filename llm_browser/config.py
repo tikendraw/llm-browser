@@ -13,6 +13,10 @@ CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
+SOCKET_PATH = CONFIG_DIR / "server.sock"
+PID_PATH    = CONFIG_DIR / "server.pid"
+SERVER_LOG  = LOGS_DIR / "server.log"
+
 # Timeouts (milliseconds)
 NAVIGATION_TIMEOUT = 30_000
 RESPONSE_TIMEOUT = 120_000      # 2 min max for a full LLM response

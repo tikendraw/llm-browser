@@ -57,6 +57,13 @@ class BrowserSession:
             viewport={"width": 1280, "height": 800},
         )
         self._context.set_default_timeout(NAVIGATION_TIMEOUT)
+        # Block media that isn't needed for text-based LLM UIs
+        await self._context.route(
+            "**/*",
+            lambda route: route.abort()
+            if route.request.resource_type in ("image", "media", "font")
+            else route.continue_(),
+        )
         # Reuse existing tab or open a fresh one
         pages = self._context.pages
         self._page = pages[0] if pages else await self._context.new_page()

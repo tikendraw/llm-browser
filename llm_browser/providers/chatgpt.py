@@ -100,6 +100,17 @@ class ChatGPTProvider(BaseProvider):
                     "() => document.querySelector('[data-stream-active]') !== null"
                 )
                 if not is_streaming:
+                    # data-stream-active is removed before the final characters
+                    # are painted. Wait one poll cycle then do a final read so
+                    # we don't drop the last few chars of the response.
+                    await page.wait_for_timeout(POLL_INTERVAL_MS)
+                    for sel in text_selectors:
+                        els = await last_turn.query_selector_all(sel)
+                        if els:
+                            final_text = (await els[-1].inner_text()).strip()
+                            if final_text.startswith(last_text) and final_text != last_text:
+                                yield final_text[len(last_text):]
+                            break
                     break
                 stable_count = 0  # still generating
 
